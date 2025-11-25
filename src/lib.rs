@@ -7,12 +7,19 @@ mod multi_map;
 mod protocol;
 mod transport;
 
+#[cfg(feature = "api")]
+mod api;
+
+#[cfg(feature = "api")]
+mod api_client;
+
 pub use cli::Cli;
 use cli::KeypairType;
 pub use config::Config;
 pub use constants::UDP_BUFFER_SIZE;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
+use std::collections::HashMap;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info};
 
@@ -23,12 +30,179 @@ use client::run_client;
 
 #[cfg(feature = "server")]
 mod server;
-#[cfg(feature = "server")]
+#[cfg(all(feature = "server", not(feature = "api")))]
 use server::run_server;
+#[cfg(all(feature = "server", feature = "api"))]
+use server::run_server_with_api;
 
 use crate::config_watcher::{ConfigChange, ConfigWatcherHandle};
 
 const DEFAULT_CURVE: KeypairType = KeypairType::X25519;
+
+/// Run in CLI mode - build config from command line arguments
+#[cfg(feature = "client")]
+async fn run_cli_mode(
+    args: Cli,
+    remote: String,
+    shutdown_rx: broadcast::Receiver<bool>,
+) -> Result<()> {
+    use config::{AutoRegisterConfig, ClientConfig, ClientServiceConfig, MaskedString, ServiceType};
+
+    // Token is required
+    let token = args.token.ok_or_else(|| {
+        anyhow::anyhow!("--token is required when using --remote")
+    })?;
+
+    // Build services from -L arguments
+    let mut services = HashMap::new();
+    for svc in &args.services {
+        let service_config = ClientServiceConfig {
+            service_type: ServiceType::Tcp,
+            name: svc.name.clone(),
+            local_addr: svc.local_addr.clone(),
+            prefer_ipv6: false,
+            token: Some(MaskedString::from(token.as_str())),
+            nodelay: None,
+            retry_interval: Some(1), // Default retry interval
+            bind_addr: svc.bind_addr.clone(),
+        };
+        services.insert(svc.name.clone(), service_config);
+    }
+
+    if services.is_empty() {
+        bail!("At least one service is required. Use -L name:local_addr[:bind_addr]");
+    }
+
+    // Build auto_register config if API is specified
+    let auto_register = if let Some(api_addr) = args.api {
+        Some(AutoRegisterConfig {
+            enabled: true,
+            api_addr: Some(api_addr),
+            api_token: args.api_token.map(|t| MaskedString::from(t.as_str())),
+        })
+    } else {
+        None
+    };
+
+    let client_config = ClientConfig {
+        remote_addr: remote,
+        default_token: Some(MaskedString::from(token.as_str())),
+        prefer_ipv6: None,
+        services,
+        transport: Default::default(),
+        heartbeat_timeout: 40,
+        retry_interval: 1,
+        auto_register,
+    };
+
+    let config = Config {
+        server: None,
+        client: Some(client_config),
+    };
+
+    info!("Running in CLI mode");
+    debug!("Config: {:?}", config);
+
+    // Create a dummy update channel (no hot-reload in CLI mode)
+    let (_update_tx, update_rx) = mpsc::channel(1);
+
+    run_client(config, shutdown_rx, update_rx).await
+}
+
+#[cfg(not(feature = "client"))]
+async fn run_cli_mode(
+    _args: Cli,
+    _remote: String,
+    _shutdown_rx: broadcast::Receiver<bool>,
+) -> Result<()> {
+    crate::helper::feature_not_compile("client")
+}
+
+/// Run server in CLI mode
+#[cfg(all(feature = "server", feature = "api"))]
+async fn run_server_cli_mode(
+    args: Cli,
+    bind: String,
+    shutdown_rx: broadcast::Receiver<bool>,
+) -> Result<()> {
+    use config::{ApiConfig, MaskedString, ServerConfig};
+
+    // Token is required
+    let token = args.token.ok_or_else(|| {
+        anyhow::anyhow!("--token is required when using --bind")
+    })?;
+
+    // Build API config if specified
+    let api = if let Some(api_bind) = args.api_bind {
+        Some(ApiConfig {
+            enabled: true,
+            bind_addr: api_bind,
+            token: args.api_token.map(|t| MaskedString::from(t.as_str())),
+        })
+    } else {
+        None
+    };
+
+    let server_config = ServerConfig {
+        bind_addr: bind,
+        default_token: Some(MaskedString::from(token.as_str())),
+        services: HashMap::new(),
+        transport: Default::default(),
+        heartbeat_interval: 30,
+        api,
+    };
+
+    let config = Config {
+        server: Some(server_config),
+        client: None,
+    };
+
+    info!("Running server in CLI mode");
+    debug!("Config: {:?}", config);
+
+    let (_update_tx, update_rx) = mpsc::channel(1);
+    run_server_with_api(config, None, shutdown_rx, update_rx).await
+}
+
+#[cfg(all(feature = "server", not(feature = "api")))]
+async fn run_server_cli_mode(
+    args: Cli,
+    bind: String,
+    shutdown_rx: broadcast::Receiver<bool>,
+) -> Result<()> {
+    use config::{MaskedString, ServerConfig};
+
+    let token = args.token.ok_or_else(|| {
+        anyhow::anyhow!("--token is required when using --bind")
+    })?;
+
+    let server_config = ServerConfig {
+        bind_addr: bind,
+        default_token: Some(MaskedString::from(token.as_str())),
+        services: HashMap::new(),
+        transport: Default::default(),
+        heartbeat_interval: 30,
+        api: None,
+    };
+
+    let config = Config {
+        server: Some(server_config),
+        client: None,
+    };
+
+    info!("Running server in CLI mode");
+    let (_update_tx, update_rx) = mpsc::channel(1);
+    run_server(config, shutdown_rx, update_rx).await
+}
+
+#[cfg(not(feature = "server"))]
+async fn run_server_cli_mode(
+    _args: Cli,
+    _bind: String,
+    _shutdown_rx: broadcast::Receiver<bool>,
+) -> Result<()> {
+    crate::helper::feature_not_compile("server")
+}
 
 fn get_str_from_keypair_type(curve: KeypairType) -> &'static str {
     match curve {
@@ -67,9 +241,19 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
     // Raise `nofile` limit on linux and mac
     fdlimit::raise_fd_limit();
 
+    // Check if running in CLI mode
+    // Client CLI mode: --remote specified
+    if let Some(ref remote) = args.remote {
+        return run_cli_mode(args.clone(), remote.clone(), shutdown_rx).await;
+    }
+    // Server CLI mode: --bind specified
+    if let Some(ref bind) = args.bind {
+        return run_server_cli_mode(args.clone(), bind.clone(), shutdown_rx).await;
+    }
+
     // Spawn a config watcher. The watcher will send a initial signal to start the instance with a config
-    let config_path = args.config_path.as_ref().unwrap();
-    let mut cfg_watcher = ConfigWatcherHandle::new(config_path, shutdown_rx).await?;
+    let config_path = args.config_path.as_ref().unwrap().clone();
+    let mut cfg_watcher = ConfigWatcherHandle::new(&config_path, shutdown_rx).await?;
 
     // shutdown_tx owns the instance
     let (shutdown_tx, _) = broadcast::channel(1);
@@ -94,6 +278,7 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
                     tokio::spawn(run_instance(
                         *config,
                         args.clone(),
+                        config_path.clone(),
                         shutdown_tx.subscribe(),
                         service_update_rx,
                     )),
@@ -117,6 +302,7 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
 async fn run_instance(
     config: Config,
     args: Cli,
+    config_path: std::path::PathBuf,
     shutdown_rx: broadcast::Receiver<bool>,
     service_update: mpsc::Receiver<ConfigChange>,
 ) -> Result<()> {
@@ -131,8 +317,15 @@ async fn run_instance(
         RunMode::Server => {
             #[cfg(not(feature = "server"))]
             crate::helper::feature_not_compile("server");
-            #[cfg(feature = "server")]
-            run_server(config, shutdown_rx, service_update).await
+            #[cfg(all(feature = "server", feature = "api"))]
+            {
+                run_server_with_api(config, Some(config_path), shutdown_rx, service_update).await
+            }
+            #[cfg(all(feature = "server", not(feature = "api")))]
+            {
+                let _ = config_path; // Suppress unused warning
+                run_server(config, shutdown_rx, service_update).await
+            }
         }
     }
 }

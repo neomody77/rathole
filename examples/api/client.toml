@@ -1,0 +1,29 @@
+# Client configuration with auto-register enabled
+# 启用自动注册的客户端配置
+
+[client]
+remote_addr = "server.example.com:2333"
+default_token = "default_secret"
+heartbeat_timeout = 40
+retry_interval = 1
+
+# Auto-register configuration / 自动注册配置
+# When enabled, the client will automatically register services with the server API
+# 启用后，客户端会自动向服务端API注册服务
+[client.auto_register]
+enabled = true
+api_addr = "server.example.com:3000"  # Server API address / 服务端API地址
+api_token = "admin_api_token"          # API authentication token / API认证令牌
+
+# Services to forward / 需要转发的服务
+# With auto_register enabled, these services will be automatically registered on the server
+# 启用auto_register后，这些服务会自动在服务端注册
+[client.services.example_ssh]
+local_addr = "127.0.0.1:22"
+token = "ssh_secret"
+bind_addr = "0.0.0.0:0"  # Use port 0 for auto-allocation / 使用端口0自动分配
+
+[client.services.example_web]
+local_addr = "127.0.0.1:8080"
+token = "web_secret"
+bind_addr = "0.0.0.0:8080"  # Or specify a fixed port / 或指定固定端口

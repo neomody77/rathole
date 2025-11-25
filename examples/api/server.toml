@@ -1,0 +1,18 @@
+# Server configuration with HTTP API enabled
+# 启用HTTP API的服务端配置
+
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "default_secret"
+heartbeat_interval = 30
+
+# API configuration / API配置
+[server.api]
+enabled = true
+bind_addr = "127.0.0.1:3000"  # API listening address / API监听地址
+token = "admin_api_token"     # API authentication token / API认证令牌
+
+# Pre-configured services (optional) / 预配置的服务（可选）
+[server.services.example_ssh]
+bind_addr = "0.0.0.0:5022"
+token = "ssh_secret"

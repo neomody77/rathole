@@ -28,6 +28,9 @@ use crate::transport::TlsTransport;
 #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
 use crate::transport::WebsocketTransport;
 
+#[cfg(feature = "api")]
+use crate::api_client::{derive_api_addr, ApiClient};
+
 use crate::constants::{run_control_chan_backoff, UDP_BUFFER_SIZE, UDP_SENDQ_SIZE, UDP_TIMEOUT};
 
 // The entrypoint of running a client
@@ -105,6 +108,16 @@ impl<T: 'static + Transport> Client<T> {
         mut shutdown_rx: broadcast::Receiver<bool>,
         mut update_rx: mpsc::Receiver<ConfigChange>,
     ) -> Result<()> {
+        // Auto-register services with server API if enabled
+        #[cfg(feature = "api")]
+        {
+            if let Some(ref auto_reg) = self.config.auto_register {
+                if auto_reg.enabled {
+                    self.auto_register_services().await;
+                }
+            }
+        }
+
         for (name, config) in &self.config.services {
             // Create a control channel for each service defined
             let handle = ControlChannelHandle::new(
@@ -162,6 +175,62 @@ impl<T: 'static + Transport> Client<T> {
                 }
             },
             ignored => warn!("Ignored {:?} since running as a client", ignored),
+        }
+    }
+
+    /// Auto-register services with the server API
+    #[cfg(feature = "api")]
+    async fn auto_register_services(&self) {
+        let auto_reg = match &self.config.auto_register {
+            Some(ar) => ar,
+            None => return,
+        };
+
+        let api_addr = derive_api_addr(
+            &self.config.remote_addr,
+            auto_reg.api_addr.as_deref(),
+            3000, // Default API port
+        );
+
+        let api_token = match &auto_reg.api_token {
+            Some(t) => t.to_string(),
+            None => {
+                warn!("Auto-register enabled but no api_token configured");
+                return;
+            }
+        };
+
+        info!("Auto-registering services with API at {}", api_addr);
+        let client = ApiClient::new(&api_addr, &api_token);
+
+        // Check API connectivity
+        match client.health_check() {
+            Ok(true) => debug!("API server is reachable"),
+            Ok(false) => {
+                warn!("API server health check failed, services may not be registered");
+            }
+            Err(e) => {
+                warn!("Failed to connect to API server: {}", e);
+                return;
+            }
+        }
+
+        // Register each service
+        for (name, service) in &self.config.services {
+            debug!("Registering service '{}'", name);
+            match client.register_service(service) {
+                Ok(info) => {
+                    info!(
+                        "Service '{}' registered, server listening at {}",
+                        name, info.bind_addr
+                    );
+                }
+                Err(e) => {
+                    // Log error but continue with other services
+                    // The service might already exist on the server
+                    warn!("Failed to register service '{}': {}", name, e);
+                }
+            }
         }
     }
 }

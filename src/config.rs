@@ -68,6 +68,8 @@ pub struct ClientServiceConfig {
     pub token: Option<MaskedString>,
     pub nodelay: Option<bool>,
     pub retry_interval: Option<u64>,
+    /// Server-side bind address for auto-register (use port 0 for auto-allocation)
+    pub bind_addr: Option<String>,
 }
 
 impl ClientServiceConfig {
@@ -143,6 +145,20 @@ pub struct WebsocketConfig {
     pub tls: bool,
 }
 
+fn default_api_bind_addr() -> String {
+    String::from("127.0.0.1:3000")
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ApiConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_api_bind_addr")]
+    pub bind_addr: String,
+    pub token: Option<MaskedString>,
+}
+
 fn default_nodelay() -> bool {
     DEFAULT_NODELAY
 }
@@ -200,6 +216,15 @@ fn default_client_retry_interval() -> u64 {
 
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
+pub struct AutoRegisterConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub api_addr: Option<String>,
+    pub api_token: Option<MaskedString>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ClientConfig {
     pub remote_addr: String,
     pub default_token: Option<MaskedString>,
@@ -211,6 +236,7 @@ pub struct ClientConfig {
     pub heartbeat_timeout: u64,
     #[serde(default = "default_client_retry_interval")]
     pub retry_interval: u64,
+    pub auto_register: Option<AutoRegisterConfig>,
 }
 
 fn default_heartbeat_interval() -> u64 {
@@ -227,6 +253,7 @@ pub struct ServerConfig {
     pub transport: TransportConfig,
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval: u64,
+    pub api: Option<ApiConfig>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]

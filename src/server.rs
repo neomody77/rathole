@@ -30,6 +30,8 @@ use crate::transport::TlsTransport;
 #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
 use crate::transport::WebsocketTransport;
 
+#[cfg(feature = "api")]
+
 type ServiceDigest = protocol::Digest; // SHA256 of a service name
 type Nonce = protocol::Digest; // Also called `session_key`
 
@@ -39,6 +41,7 @@ const CHAN_SIZE: usize = 2048; // The capacity of various chans
 const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
 
 // The entrypoint of running a server
+#[cfg(not(feature = "api"))]
 pub async fn run_server(
     config: Config,
     shutdown_rx: broadcast::Receiver<bool>,
@@ -88,6 +91,132 @@ pub async fn run_server(
     Ok(())
 }
 
+/// Extended entrypoint that also starts the API server
+#[cfg(feature = "api")]
+pub async fn run_server_with_api(
+    config: Config,
+    config_path: Option<std::path::PathBuf>,
+    shutdown_rx: broadcast::Receiver<bool>,
+    update_rx: mpsc::Receiver<ConfigChange>,
+) -> Result<()> {
+    use crate::api::run_api_server;
+
+    let server_config = match config.server {
+        Some(ref config) => config.clone(),
+        None => {
+            return Err(anyhow!("Try to run as a server, but the configuration is missing. Please add the `[server]` block"))
+        }
+    };
+
+    // Create API event channel
+    let (api_event_tx, api_event_rx) = mpsc::unbounded_channel::<ConfigChange>();
+
+    // Create services map that will be shared with API
+    let services = Arc::new(RwLock::new(generate_service_hashmap(&server_config)));
+
+    // Start API server if enabled
+    let api_handle = if let Some(ref api_config) = server_config.api {
+        if api_config.enabled {
+            let api_config = api_config.clone();
+            let services_clone = services.clone();
+            let shutdown_rx_clone = shutdown_rx.resubscribe();
+            let config_path_clone = config_path.clone();
+
+            Some(tokio::spawn(async move {
+                if let Err(e) = run_api_server(
+                    api_config,
+                    services_clone,
+                    config_path_clone,
+                    api_event_tx,
+                    shutdown_rx_clone,
+                )
+                .await
+                {
+                    error!("API server error: {:#}", e);
+                }
+            }))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Create merged update receiver that combines file watcher and API updates
+    let merged_update_rx = merge_config_updates(update_rx, api_event_rx);
+
+    // Run the main server with shared services
+    match server_config.transport.transport_type {
+        TransportType::Tcp => {
+            let mut server = Server::<TcpTransport>::from_with_services(server_config, services).await?;
+            server.run(shutdown_rx, merged_update_rx).await?;
+        }
+        TransportType::Tls => {
+            #[cfg(any(feature = "native-tls", feature = "rustls"))]
+            {
+                let mut server = Server::<TlsTransport>::from_with_services(server_config, services).await?;
+                server.run(shutdown_rx, merged_update_rx).await?;
+            }
+            #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
+            crate::helper::feature_neither_compile("native-tls", "rustls")
+        }
+        TransportType::Noise => {
+            #[cfg(feature = "noise")]
+            {
+                let mut server = Server::<NoiseTransport>::from_with_services(server_config, services).await?;
+                server.run(shutdown_rx, merged_update_rx).await?;
+            }
+            #[cfg(not(feature = "noise"))]
+            crate::helper::feature_not_compile("noise")
+        }
+        TransportType::Websocket => {
+            #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
+            {
+                let mut server = Server::<WebsocketTransport>::from_with_services(server_config, services).await?;
+                server.run(shutdown_rx, merged_update_rx).await?;
+            }
+            #[cfg(not(any(feature = "websocket-native-tls", feature = "websocket-rustls")))]
+            crate::helper::feature_neither_compile("websocket-native-tls", "websocket-rustls")
+        }
+    }
+
+    // Wait for API server to finish
+    if let Some(handle) = api_handle {
+        let _ = handle.await;
+    }
+
+    Ok(())
+}
+
+/// Merge config updates from file watcher and API into a single receiver
+#[cfg(feature = "api")]
+fn merge_config_updates(
+    mut file_rx: mpsc::Receiver<ConfigChange>,
+    mut api_rx: mpsc::UnboundedReceiver<ConfigChange>,
+) -> mpsc::Receiver<ConfigChange> {
+    let (tx, rx) = mpsc::channel(1024);
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                Some(event) = file_rx.recv() => {
+                    if tx.send(event).await.is_err() {
+                        break;
+                    }
+                }
+                Some(event) = api_rx.recv() => {
+                    if tx.send(event).await.is_err() {
+                        break;
+                    }
+                }
+                else => break,
+            }
+        }
+    });
+
+    rx
+}
+
 // A hash map of ControlChannelHandles, indexed by ServiceDigest or Nonce
 // See also MultiMap
 type ControlChannelMap<T> = MultiMap<ServiceDigest, Nonce, ControlChannelHandle<T>>;
@@ -118,9 +247,27 @@ fn generate_service_hashmap(
 
 impl<T: 'static + Transport> Server<T> {
     // Create a server from `[server]`
+    #[cfg(not(feature = "api"))]
     pub async fn from(config: ServerConfig) -> Result<Server<T>> {
         let config = Arc::new(config);
         let services = Arc::new(RwLock::new(generate_service_hashmap(&config)));
+        let control_channels = Arc::new(RwLock::new(ControlChannelMap::new()));
+        let transport = Arc::new(T::new(&config.transport)?);
+        Ok(Server {
+            config,
+            services,
+            control_channels,
+            transport,
+        })
+    }
+
+    // Create a server with pre-existing services map (for API integration)
+    #[cfg(feature = "api")]
+    pub async fn from_with_services(
+        config: ServerConfig,
+        services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
+    ) -> Result<Server<T>> {
+        let config = Arc::new(config);
         let control_channels = Arc::new(RwLock::new(ControlChannelMap::new()));
         let transport = Arc::new(T::new(&config.transport)?);
         Ok(Server {

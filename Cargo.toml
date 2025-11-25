@@ -18,12 +18,16 @@ default = [
     "noise",
     "websocket-native-tls",
     "hot-reload",
+    "api",
 ]
 
 # Run as a server
 server = []
 # Run as a client
 client = []
+
+# HTTP API for dynamic service management
+api = ["axum", "tower-http", "serde_json"]
 
 # TLS support
 native-tls = ["tokio-native-tls"]
@@ -125,6 +129,11 @@ tokio-rustls = { version = "0.25", optional = true }
 rustls-native-certs = { version = "0.7", optional = true }
 rustls-pemfile = { version = "2.0", optional = true }
 p12 = { version = "0.6.3", optional = true }
+
+# HTTP API dependencies
+axum = { version = "0.7", optional = true, features = ["macros"] }
+tower-http = { version = "0.5", optional = true, features = ["cors", "trace"] }
+serde_json = { version = "1.0", optional = true }
 
 [target.'cfg(target_env = "musl")'.dependencies]
 openssl = { version = "0.10", features = ["vendored"], optional = true }
