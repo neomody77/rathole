@@ -1,4 +1,4 @@
-use crate::config::{ApiConfig, MaskedString, ServerServiceConfig, ServiceType};
+use crate::config::{ApiConfig, ClientServiceConfig, MaskedString, ServerServiceConfig, ServiceType, StoredClientConfig};
 use crate::config_watcher::{ConfigChange, ServerServiceChange};
 use crate::protocol;
 use anyhow::{anyhow, Result};
@@ -28,6 +28,8 @@ pub struct ApiState {
     pub services_by_name: Arc<RwLock<HashMap<String, ServerServiceConfig>>>,
     pub config_path: Option<PathBuf>,
     pub event_tx: mpsc::UnboundedSender<ConfigChange>,
+    pub client_configs: Arc<RwLock<HashMap<String, StoredClientConfig>>>,
+    pub server_bind_addr: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -63,12 +65,37 @@ pub struct ApiError {
     pub error: String,
 }
 
+/// Response for GET /api/config/{token}
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ClientConfigResponse {
+    pub remote_addr: String,
+    pub services: HashMap<String, ClientServiceInfo>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ClientServiceInfo {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub service_type: String,
+    pub local_addr: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bind_addr: Option<String>,
+}
+
+/// Request for creating/updating client config
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateClientConfigRequest {
+    pub services: HashMap<String, ClientServiceInfo>,
+}
+
 impl ApiState {
     pub fn new(
         config: ApiConfig,
         services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
         config_path: Option<PathBuf>,
         event_tx: mpsc::UnboundedSender<ConfigChange>,
+        client_configs: HashMap<String, StoredClientConfig>,
+        server_bind_addr: String,
     ) -> Self {
         Self {
             config,
@@ -76,6 +103,8 @@ impl ApiState {
             services_by_name: Arc::new(RwLock::new(HashMap::new())),
             config_path,
             event_tx,
+            client_configs: Arc::new(RwLock::new(client_configs)),
+            server_bind_addr,
         }
     }
 
@@ -377,6 +406,286 @@ async fn delete_service(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Get client configuration by token
+/// This endpoint uses the token as authentication, no separate API token needed
+async fn get_client_config(
+    State(state): State<ApiState>,
+    Path(token): Path<String>,
+) -> Result<Json<ClientConfigResponse>, (StatusCode, Json<ApiError>)> {
+    let client_configs = state.client_configs.read().await;
+
+    match client_configs.get(&token) {
+        Some(stored_config) => {
+            let mut services = HashMap::new();
+            for (name, svc) in &stored_config.services {
+                services.insert(
+                    name.clone(),
+                    ClientServiceInfo {
+                        name: name.clone(),
+                        service_type: match svc.service_type {
+                            ServiceType::Tcp => "tcp".to_string(),
+                            ServiceType::Udp => "udp".to_string(),
+                        },
+                        local_addr: svc.local_addr.clone(),
+                        bind_addr: svc.bind_addr.clone(),
+                    },
+                );
+            }
+
+            Ok(Json(ClientConfigResponse {
+                remote_addr: state.server_bind_addr.clone(),
+                services,
+            }))
+        }
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiError {
+                error: format!("No configuration found for token"),
+            }),
+        )),
+    }
+}
+
+/// Create or update client configuration by token
+/// Requires API token for authentication
+async fn create_client_config(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(token): Path<String>,
+    Json(req): Json<CreateClientConfigRequest>,
+) -> Result<(StatusCode, Json<ClientConfigResponse>), (StatusCode, Json<ApiError>)> {
+    validate_token(&state, &headers)?;
+
+    // Convert ClientServiceInfo to ClientServiceConfig
+    let mut services = HashMap::new();
+    for (name, svc_info) in req.services {
+        let service_type = match svc_info.service_type.to_lowercase().as_str() {
+            "tcp" => ServiceType::Tcp,
+            "udp" => ServiceType::Udp,
+            _ => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiError {
+                        error: format!("Invalid service type: {}", svc_info.service_type),
+                    }),
+                ))
+            }
+        };
+
+        services.insert(
+            name.clone(),
+            ClientServiceConfig {
+                service_type,
+                name: name.clone(),
+                local_addr: svc_info.local_addr,
+                prefer_ipv6: false,
+                token: Some(MaskedString::from(token.as_str())),
+                nodelay: None,
+                retry_interval: None,
+                bind_addr: svc_info.bind_addr,
+            },
+        );
+    }
+
+    let stored_config = StoredClientConfig { services };
+
+    // Store the config
+    {
+        let mut client_configs = state.client_configs.write().await;
+        let is_new = !client_configs.contains_key(&token);
+        client_configs.insert(token.clone(), stored_config.clone());
+
+        info!(
+            "Client config for token '{}' {}",
+            token,
+            if is_new { "created" } else { "updated" }
+        );
+    }
+
+    // Persist to config file if path is set
+    if let Some(ref config_path) = state.config_path {
+        if let Err(e) = persist_client_config_to_file(config_path, &token, &stored_config).await {
+            error!("Failed to persist client config: {}", e);
+        }
+    }
+
+    // Build response
+    let mut response_services = HashMap::new();
+    for (name, svc) in &stored_config.services {
+        response_services.insert(
+            name.clone(),
+            ClientServiceInfo {
+                name: name.clone(),
+                service_type: match svc.service_type {
+                    ServiceType::Tcp => "tcp".to_string(),
+                    ServiceType::Udp => "udp".to_string(),
+                },
+                local_addr: svc.local_addr.clone(),
+                bind_addr: svc.bind_addr.clone(),
+            },
+        );
+    }
+
+    Ok((
+        StatusCode::CREATED,
+        Json(ClientConfigResponse {
+            remote_addr: state.server_bind_addr.clone(),
+            services: response_services,
+        }),
+    ))
+}
+
+/// Delete client configuration by token
+/// Requires API token for authentication
+async fn delete_client_config(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(token): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    validate_token(&state, &headers)?;
+
+    let mut client_configs = state.client_configs.write().await;
+
+    if client_configs.remove(&token).is_none() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiError {
+                error: format!("No configuration found for token"),
+            }),
+        ));
+    }
+
+    // Remove from config file if path is set
+    if let Some(ref config_path) = state.config_path {
+        if let Err(e) = remove_client_config_from_file(config_path, &token).await {
+            error!("Failed to remove client config from file: {}", e);
+        }
+    }
+
+    info!("Client config for token '{}' deleted", token);
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// List all client configs (admin only)
+async fn list_client_configs(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<HashMap<String, ClientConfigResponse>>, (StatusCode, Json<ApiError>)> {
+    validate_token(&state, &headers)?;
+
+    let client_configs = state.client_configs.read().await;
+    let mut result = HashMap::new();
+
+    for (token, stored_config) in client_configs.iter() {
+        let mut services = HashMap::new();
+        for (name, svc) in &stored_config.services {
+            services.insert(
+                name.clone(),
+                ClientServiceInfo {
+                    name: name.clone(),
+                    service_type: match svc.service_type {
+                        ServiceType::Tcp => "tcp".to_string(),
+                        ServiceType::Udp => "udp".to_string(),
+                    },
+                    local_addr: svc.local_addr.clone(),
+                    bind_addr: svc.bind_addr.clone(),
+                },
+            );
+        }
+        result.insert(
+            token.clone(),
+            ClientConfigResponse {
+                remote_addr: state.server_bind_addr.clone(),
+                services,
+            },
+        );
+    }
+
+    Ok(Json(result))
+}
+
+async fn persist_client_config_to_file(
+    config_path: &PathBuf,
+    token: &str,
+    config: &StoredClientConfig,
+) -> Result<()> {
+    use tokio::fs;
+
+    let content = fs::read_to_string(config_path).await?;
+    let mut doc: toml::Value = toml::from_str(&content)?;
+
+    let server = doc
+        .get_mut("server")
+        .ok_or_else(|| anyhow!("No [server] section in config"))?;
+
+    let client_configs = server
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("Invalid server section"))?
+        .entry("client_configs")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+
+    let client_configs_table = client_configs
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("Invalid client_configs section"))?;
+
+    // Build the config table
+    let mut token_table = toml::map::Map::new();
+    let mut services_table = toml::map::Map::new();
+
+    for (name, svc) in &config.services {
+        let mut svc_table = toml::map::Map::new();
+        svc_table.insert(
+            "type".to_string(),
+            toml::Value::String(match svc.service_type {
+                ServiceType::Tcp => "tcp".to_string(),
+                ServiceType::Udp => "udp".to_string(),
+            }),
+        );
+        svc_table.insert(
+            "local_addr".to_string(),
+            toml::Value::String(svc.local_addr.clone()),
+        );
+        if let Some(ref bind_addr) = svc.bind_addr {
+            svc_table.insert(
+                "bind_addr".to_string(),
+                toml::Value::String(bind_addr.clone()),
+            );
+        }
+        services_table.insert(name.clone(), toml::Value::Table(svc_table));
+    }
+
+    token_table.insert("services".to_string(), toml::Value::Table(services_table));
+    client_configs_table.insert(token.to_string(), toml::Value::Table(token_table));
+
+    let new_content = toml::to_string_pretty(&doc)?;
+    fs::write(config_path, new_content).await?;
+
+    Ok(())
+}
+
+async fn remove_client_config_from_file(config_path: &PathBuf, token: &str) -> Result<()> {
+    use tokio::fs;
+
+    let content = fs::read_to_string(config_path).await?;
+    let mut doc: toml::Value = toml::from_str(&content)?;
+
+    if let Some(server) = doc.get_mut("server") {
+        if let Some(server_table) = server.as_table_mut() {
+            if let Some(client_configs) = server_table.get_mut("client_configs") {
+                if let Some(client_configs_table) = client_configs.as_table_mut() {
+                    client_configs_table.remove(token);
+                }
+            }
+        }
+    }
+
+    let new_content = toml::to_string_pretty(&doc)?;
+    fs::write(config_path, new_content).await?;
+
+    Ok(())
+}
+
 async fn persist_service_to_config(config_path: &PathBuf, service: &ServerServiceConfig) -> Result<()> {
     use tokio::fs;
 
@@ -458,6 +767,11 @@ pub fn create_router(state: ApiState) -> Router {
         .route("/api/services", post(create_service))
         .route("/api/services/{name}", get(get_service))
         .route("/api/services/{name}", delete(delete_service))
+        // Client config endpoints
+        .route("/api/configs", get(list_client_configs))
+        .route("/api/config/{token}", get(get_client_config))
+        .route("/api/config/{token}", post(create_client_config))
+        .route("/api/config/{token}", delete(delete_client_config))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -467,9 +781,11 @@ pub async fn run_api_server(
     services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
     config_path: Option<PathBuf>,
     event_tx: mpsc::UnboundedSender<ConfigChange>,
+    client_configs: HashMap<String, StoredClientConfig>,
+    server_bind_addr: String,
     mut shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
-    let state = ApiState::new(config.clone(), services, config_path, event_tx);
+    let state = ApiState::new(config.clone(), services, config_path, event_tx, client_configs, server_bind_addr);
     let app = create_router(state);
 
     let addr: SocketAddr = config.bind_addr.parse()?;

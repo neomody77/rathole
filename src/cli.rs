@@ -87,7 +87,7 @@ cargo Features:      {}
 #[clap(group(
             ArgGroup::new("cmds")
                 .required(true)
-                .args(&["CONFIG", "genkey", "remote", "bind"]),
+                .args(&["CONFIG", "genkey", "remote", "bind", "config-server"]),
         ))]
 pub struct Cli {
     /// The path to the configuration file
@@ -156,4 +156,13 @@ pub struct Cli {
     /// Example: --api-bind 0.0.0.0:3000
     #[clap(long, value_name = "ADDR")]
     pub api_bind: Option<String>,
+
+    // ===== Config pull mode arguments =====
+
+    /// Pull configuration from API server
+    ///
+    /// The client will fetch its configuration from the API server using the token.
+    /// Example: --config-server n100:3000 --token mytoken
+    #[clap(long, value_name = "ADDR")]
+    pub config_server: Option<String>,
 }

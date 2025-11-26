@@ -118,6 +118,83 @@ async fn run_cli_mode(
     crate::helper::feature_not_compile("client")
 }
 
+/// Run in config pull mode - fetch config from server
+#[cfg(all(feature = "client", feature = "api"))]
+async fn run_config_pull_mode(
+    args: Cli,
+    config_server: String,
+    shutdown_rx: broadcast::Receiver<bool>,
+) -> Result<()> {
+    use api_client::ApiClient;
+    use config::{ClientConfig, ClientServiceConfig, MaskedString, ServiceType};
+
+    // Token is required
+    let token = args.token.ok_or_else(|| {
+        anyhow::anyhow!("--token is required when using --config-server")
+    })?;
+
+    info!("Fetching configuration from server: {}", config_server);
+
+    // Create API client and pull config
+    let api_client = ApiClient::new(&config_server, "");
+    let pulled_config = api_client.pull_config(&token)?;
+
+    // Convert pulled config to ClientConfig
+    let mut services = HashMap::new();
+    for (name, svc) in pulled_config.services {
+        let service_type = match svc.service_type.as_str() {
+            "udp" => ServiceType::Udp,
+            _ => ServiceType::Tcp,
+        };
+        let service_config = ClientServiceConfig {
+            service_type,
+            name: name.clone(),
+            local_addr: svc.local_addr,
+            prefer_ipv6: false,
+            token: Some(MaskedString::from(token.as_str())),
+            nodelay: None,
+            retry_interval: Some(1),
+            bind_addr: svc.bind_addr,
+        };
+        services.insert(name, service_config);
+    }
+
+    if services.is_empty() {
+        bail!("No services configured for token: {}", token);
+    }
+
+    let client_config = ClientConfig {
+        remote_addr: pulled_config.remote_addr,
+        default_token: Some(MaskedString::from(token.as_str())),
+        prefer_ipv6: None,
+        services,
+        transport: Default::default(),
+        heartbeat_timeout: 40,
+        retry_interval: 1,
+        auto_register: None,
+    };
+
+    let config = Config {
+        server: None,
+        client: Some(client_config),
+    };
+
+    info!("Running in config pull mode");
+    debug!("Config: {:?}", config);
+
+    let (_update_tx, update_rx) = mpsc::channel(1);
+    run_client(config, shutdown_rx, update_rx).await
+}
+
+#[cfg(not(all(feature = "client", feature = "api")))]
+async fn run_config_pull_mode(
+    _args: Cli,
+    _config_server: String,
+    _shutdown_rx: broadcast::Receiver<bool>,
+) -> Result<()> {
+    crate::helper::feature_not_compile("client and api")
+}
+
 /// Run server in CLI mode
 #[cfg(all(feature = "server", feature = "api"))]
 async fn run_server_cli_mode(
@@ -150,6 +227,7 @@ async fn run_server_cli_mode(
         transport: Default::default(),
         heartbeat_interval: 30,
         api,
+        client_configs: HashMap::new(),
     };
 
     let config = Config {
@@ -183,6 +261,7 @@ async fn run_server_cli_mode(
         transport: Default::default(),
         heartbeat_interval: 30,
         api: None,
+        client_configs: HashMap::new(),
     };
 
     let config = Config {
@@ -249,6 +328,10 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
     // Server CLI mode: --bind specified
     if let Some(ref bind) = args.bind {
         return run_server_cli_mode(args.clone(), bind.clone(), shutdown_rx).await;
+    }
+    // Config pull mode: --config-server specified
+    if let Some(ref config_server) = args.config_server {
+        return run_config_pull_mode(args.clone(), config_server.clone(), shutdown_rx).await;
     }
 
     // Spawn a config watcher. The watcher will send a initial signal to start the instance with a config

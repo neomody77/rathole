@@ -216,3 +216,107 @@ pub fn derive_api_addr(remote_addr: &str, api_addr: Option<&str>, default_port: 
         format!("{}:{}", remote_addr, default_port)
     }
 }
+
+/// Response from config pull endpoint
+#[derive(Debug, Deserialize)]
+pub struct ClientConfigResponse {
+    pub remote_addr: String,
+    pub services: std::collections::HashMap<String, PulledServiceConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PulledServiceConfig {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub service_type: String,
+    pub local_addr: String,
+    pub bind_addr: Option<String>,
+}
+
+impl ApiClient {
+    /// Pull configuration from server using token
+    pub fn pull_config(&self, token: &str) -> Result<ClientConfigResponse> {
+        let path = format!("/api/config/{}", token);
+        let response = self.http_request_no_auth("GET", &path, None)?;
+
+        if response.status >= 200 && response.status < 300 {
+            let config: ClientConfigResponse = serde_json::from_str(&response.body)
+                .with_context(|| "Failed to parse config response")?;
+            info!("Pulled configuration from server: remote_addr={}", config.remote_addr);
+            Ok(config)
+        } else {
+            let err: ApiError = serde_json::from_str(&response.body)
+                .unwrap_or(ApiError { error: response.body.clone() });
+            bail!("Failed to pull config: {}", err.error)
+        }
+    }
+
+    fn http_request_no_auth(&self, method: &str, path: &str, body: Option<&str>) -> Result<HttpResponse> {
+        let addr = &self.base_url;
+        debug!("API request (no auth): {} {} to {}", method, path, addr);
+
+        let mut stream = TcpStream::connect(addr)
+            .with_context(|| format!("Failed to connect to API server at {}", addr))?;
+
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+        stream.set_write_timeout(Some(std::time::Duration::from_secs(10)))?;
+
+        let content_length = body.map(|b| b.len()).unwrap_or(0);
+        let host = addr.split(':').next().unwrap_or(addr);
+
+        let mut request = format!(
+            "{} {} HTTP/1.1\r\n\
+             Host: {}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n",
+            method, path, host, content_length
+        );
+
+        if let Some(body) = body {
+            request.push_str(body);
+        }
+
+        stream.write_all(request.as_bytes())?;
+        stream.flush()?;
+
+        let mut reader = BufReader::new(stream);
+
+        let mut status_line = String::new();
+        reader.read_line(&mut status_line)?;
+        let status = parse_status_code(&status_line)?;
+
+        let mut content_length: usize = 0;
+        let mut chunked = false;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line)?;
+            let line = line.trim();
+            if line.is_empty() {
+                break;
+            }
+            let line_lower = line.to_lowercase();
+            if let Some(value) = line_lower.strip_prefix("content-length:") {
+                content_length = value.trim().parse().unwrap_or(0);
+            }
+            if let Some(value) = line_lower.strip_prefix("transfer-encoding:") {
+                chunked = value.trim().eq_ignore_ascii_case("chunked");
+            }
+        }
+
+        let body = if chunked {
+            read_chunked_body(&mut reader)?
+        } else if content_length > 0 {
+            let mut body = vec![0u8; content_length];
+            std::io::Read::read_exact(&mut reader, &mut body)?;
+            String::from_utf8_lossy(&body).to_string()
+        } else {
+            String::new()
+        };
+
+        debug!("API response: {} - {}", status, body);
+
+        Ok(HttpResponse { status, body })
+    }
+}

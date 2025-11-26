@@ -243,6 +243,13 @@ fn default_heartbeat_interval() -> u64 {
     DEFAULT_HEARTBEAT_INTERVAL_SECS
 }
 
+/// Client configuration stored on server, keyed by token
+#[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct StoredClientConfig {
+    pub services: HashMap<String, ClientServiceConfig>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
@@ -254,6 +261,9 @@ pub struct ServerConfig {
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval: u64,
     pub api: Option<ApiConfig>,
+    /// Client configurations stored on server, keyed by token
+    #[serde(default)]
+    pub client_configs: HashMap<String, StoredClientConfig>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]

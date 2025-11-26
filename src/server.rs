@@ -121,6 +121,8 @@ pub async fn run_server_with_api(
             let services_clone = services.clone();
             let shutdown_rx_clone = shutdown_rx.resubscribe();
             let config_path_clone = config_path.clone();
+            let client_configs = server_config.client_configs.clone();
+            let server_bind_addr = server_config.bind_addr.clone();
 
             Some(tokio::spawn(async move {
                 if let Err(e) = run_api_server(
@@ -128,6 +130,8 @@ pub async fn run_server_with_api(
                     services_clone,
                     config_path_clone,
                     api_event_tx,
+                    client_configs,
+                    server_bind_addr,
                     shutdown_rx_clone,
                 )
                 .await
