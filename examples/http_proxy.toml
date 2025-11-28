@@ -1,0 +1,53 @@
+# Example configuration for HTTP proxy with domain routing
+# This enables accessing internal services via public domains with automatic HTTPS
+
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "tunnel_secret"
+
+# HTTP API for dynamic service management
+[server.api]
+enabled = true
+bind_addr = "127.0.0.1:3000"
+token = "admin_api_token"
+
+# HTTP proxy configuration (Pingora-based, Linux only)
+# Provides domain-based routing for HTTP/HTTPS traffic
+[server.http_proxy]
+enabled = true
+http_addr = "0.0.0.0:80"      # HTTP port (for ACME challenges and redirect)
+https_addr = "0.0.0.0:443"    # HTTPS port
+
+# Let's Encrypt configuration (Phase 2 - not yet implemented)
+# [server.http_proxy.acme]
+# enabled = true
+# email = "admin@example.com"
+# cache_dir = "/var/lib/rathole/certs"
+# staging = false  # Set to true for testing
+
+# Service with single domain
+[server.services.web]
+bind_addr = "127.0.0.1:0"     # Use port 0 for auto-allocation
+token = "web_secret"
+domains = ["app.example.com"]
+
+# Service with multiple domains
+[server.services.api]
+bind_addr = "127.0.0.1:0"
+token = "api_secret"
+domains = ["api.example.com", "api-v2.example.com"]
+
+# Service with wildcard domain
+[server.services.tenant]
+bind_addr = "127.0.0.1:0"
+token = "tenant_secret"
+domains = ["*.tenants.example.com"]
+
+# Client configuration for the web service
+# (This would typically be in a separate file on the client machine)
+# [client]
+# remote_addr = "server.example.com:2333"
+#
+# [client.services.web]
+# local_addr = "127.0.0.1:8080"
+# token = "web_secret"

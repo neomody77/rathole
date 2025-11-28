@@ -146,6 +146,48 @@ pub async fn run_server_with_api(
         None
     };
 
+    // Start HTTP proxy if enabled
+    #[cfg(feature = "http-proxy")]
+    let http_proxy_handle = if let Some(ref http_proxy_config) = server_config.http_proxy {
+        if http_proxy_config.enabled {
+            use crate::http_proxy::{HttpProxyServer, HttpProxyState, ProxyServiceInfo};
+
+            let http_proxy_state = Arc::new(HttpProxyState::new());
+
+            // Initialize domain mappings from services
+            let proxy_services: Vec<ProxyServiceInfo> = {
+                let svc_map = services.read().await;
+                svc_map
+                    .values()
+                    .filter(|svc| !svc.domains.is_empty())
+                    .map(|svc| ProxyServiceInfo {
+                        name: svc.name.clone(),
+                        bind_addr: svc.bind_addr.clone(),
+                        domains: svc.domains.clone(),
+                    })
+                    .collect()
+            };
+            http_proxy_state.update_services(proxy_services).await;
+
+            let http_proxy_config = http_proxy_config.clone();
+            let shutdown_rx_clone = shutdown_rx.resubscribe();
+
+            Some(tokio::spawn(async move {
+                let server = HttpProxyServer::new(http_proxy_config, http_proxy_state);
+                if let Err(e) = server.run(shutdown_rx_clone).await {
+                    error!("HTTP proxy server error: {:#}", e);
+                }
+            }))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    #[cfg(not(feature = "http-proxy"))]
+    let http_proxy_handle: Option<tokio::task::JoinHandle<()>> = None;
+
     // Create merged update receiver that combines file watcher and API updates
     let merged_update_rx = merge_config_updates(update_rx, api_event_rx);
 
@@ -186,6 +228,11 @@ pub async fn run_server_with_api(
 
     // Wait for API server to finish
     if let Some(handle) = api_handle {
+        let _ = handle.await;
+    }
+
+    // Wait for HTTP proxy to finish
+    if let Some(handle) = http_proxy_handle {
         let _ = handle.await;
     }
 

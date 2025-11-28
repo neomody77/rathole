@@ -106,6 +106,11 @@ pub struct ServerServiceConfig {
     pub bind_addr: String,
     pub token: Option<MaskedString>,
     pub nodelay: Option<bool>,
+    /// Domain names for HTTP proxy routing
+    /// Supports multiple domains and wildcards (e.g., "*.example.com")
+    /// Examples: ["app.example.com", "*.api.example.com"]
+    #[serde(default)]
+    pub domains: Vec<String>,
 }
 
 impl ServerServiceConfig {
@@ -157,6 +162,50 @@ pub struct ApiConfig {
     #[serde(default = "default_api_bind_addr")]
     pub bind_addr: String,
     pub token: Option<MaskedString>,
+}
+
+fn default_http_proxy_http_addr() -> String {
+    String::from("0.0.0.0:80")
+}
+
+fn default_http_proxy_https_addr() -> String {
+    String::from("0.0.0.0:443")
+}
+
+fn default_acme_cache_dir() -> String {
+    String::from("/var/lib/rathole/certs")
+}
+
+/// ACME (Let's Encrypt) configuration for automatic HTTPS certificates
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AcmeConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Email for Let's Encrypt account registration
+    pub email: String,
+    /// Directory to cache certificates
+    #[serde(default = "default_acme_cache_dir")]
+    pub cache_dir: String,
+    /// Use Let's Encrypt staging environment for testing
+    #[serde(default)]
+    pub staging: bool,
+}
+
+/// HTTP proxy configuration for domain-based routing
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HttpProxyConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// HTTP listen address (for ACME challenges and HTTP->HTTPS redirect)
+    #[serde(default = "default_http_proxy_http_addr")]
+    pub http_addr: String,
+    /// HTTPS listen address
+    #[serde(default = "default_http_proxy_https_addr")]
+    pub https_addr: String,
+    /// ACME configuration for automatic HTTPS certificates
+    pub acme: Option<AcmeConfig>,
 }
 
 fn default_nodelay() -> bool {
@@ -261,6 +310,8 @@ pub struct ServerConfig {
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval: u64,
     pub api: Option<ApiConfig>,
+    /// HTTP proxy for domain-based routing with automatic HTTPS
+    pub http_proxy: Option<HttpProxyConfig>,
     /// Client configurations stored on server, keyed by token
     #[serde(default)]
     pub client_configs: HashMap<String, StoredClientConfig>,

@@ -40,6 +40,9 @@ pub struct ServiceInfo {
     pub bind_addr: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// Domain names for HTTP proxy routing (supports wildcards like "*.example.com")
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub domains: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -49,6 +52,9 @@ pub struct CreateServiceRequest {
     pub service_type: String,
     pub bind_addr: String,
     pub token: String,
+    /// Domain names for HTTP proxy routing (supports wildcards like "*.example.com")
+    #[serde(default)]
+    pub domains: Vec<String>,
 }
 
 fn default_service_type() -> String {
@@ -189,6 +195,7 @@ async fn list_services(
             },
             bind_addr: svc.bind_addr.clone(),
             token: None,
+            domains: svc.domains.clone(),
         })
         .collect();
 
@@ -216,6 +223,7 @@ async fn get_service(
             },
             bind_addr: svc.bind_addr.clone(),
             token: None,
+            domains: svc.domains.clone(),
         })),
         None => Err((
             StatusCode::NOT_FOUND,
@@ -261,6 +269,7 @@ async fn create_service(
                 },
                 bind_addr: svc.bind_addr.clone(),
                 token: None,
+                domains: svc.domains.clone(),
             })));
         }
     }
@@ -314,6 +323,7 @@ async fn create_service(
         bind_addr: bind_addr.clone(),
         token: Some(MaskedString::from(req.token.as_str())),
         nodelay: None,
+        domains: req.domains.clone(),
     };
 
     // Send update event
@@ -345,13 +355,14 @@ async fn create_service(
     Ok((
         StatusCode::CREATED,
         Json(ServiceInfo {
-            name: req.name,
+            name: req.name.clone(),
             service_type: match service_type {
                 ServiceType::Tcp => "tcp".to_string(),
                 ServiceType::Udp => "udp".to_string(),
             },
             bind_addr,
             token: None,
+            domains: req.domains,
         }),
     ))
 }

@@ -13,6 +13,9 @@ mod api;
 #[cfg(feature = "api")]
 mod api_client;
 
+#[cfg(feature = "http-proxy")]
+pub mod http_proxy;
+
 pub use cli::Cli;
 use cli::KeypairType;
 pub use config::Config;
@@ -227,6 +230,7 @@ async fn run_server_cli_mode(
         transport: Default::default(),
         heartbeat_interval: 30,
         api,
+        http_proxy: None,
         client_configs: HashMap::new(),
     };
 
@@ -261,6 +265,7 @@ async fn run_server_cli_mode(
         transport: Default::default(),
         heartbeat_interval: 30,
         api: None,
+        http_proxy: None,
         client_configs: HashMap::new(),
     };
 
