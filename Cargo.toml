@@ -139,7 +139,8 @@ tower-http = { version = "0.5", optional = true, features = ["cors", "trace"] }
 serde_json = { version = "1.0", optional = true }
 
 # HTTP proxy dependencies (Pingora-based)
-pingora = { version = "0.5", optional = true }
+# Note: "openssl" feature is required for TLS/HTTPS support
+pingora = { version = "0.5", optional = true, features = ["openssl"] }
 pingora-proxy = { version = "0.5", optional = true }
 
 [target.'cfg(target_env = "musl")'.dependencies]
