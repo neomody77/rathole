@@ -209,8 +209,19 @@ impl ProxyHttp for RatholeHttpProxy {
         session: &mut Session,
         _ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>, Box<pingora::Error>> {
-        // Get Host header
-        let host = match session.req_header().headers.get("host").and_then(|h| h.to_str().ok()) {
+        // Get host from Host header (HTTP/1.x) or :authority pseudo-header (HTTP/2)
+        let host = session
+            .req_header()
+            .headers
+            .get("host")
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                // For HTTP/2, try to get host from URI authority
+                session.req_header().uri.authority().map(|a| a.to_string())
+            });
+
+        let host = match host {
             Some(h) => h,
             None => {
                 error!("HTTP proxy: Missing Host header");
@@ -220,7 +231,7 @@ impl ProxyHttp for RatholeHttpProxy {
 
         // Look up service by domain
         let matcher = self.state.matcher.read().await;
-        let backend = match matcher.match_domain(host) {
+        let backend = match matcher.match_domain(&host) {
             Some(b) => b.clone(),
             None => {
                 warn!("HTTP proxy: Unknown domain: {}", host);
@@ -235,7 +246,7 @@ impl ProxyHttp for RatholeHttpProxy {
         // For TLS backend, use the host for SNI
         let sni = if backend.use_tls {
             // Extract hostname without port for SNI
-            host.split(':').next().unwrap_or(host).to_string()
+            host.split(':').next().unwrap_or(&host).to_string()
         } else {
             String::new()
         };
