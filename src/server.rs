@@ -164,6 +164,7 @@ pub async fn run_server_with_api(
                         name: svc.name.clone(),
                         bind_addr: svc.bind_addr.clone(),
                         domains: svc.domains.clone(),
+                        backend_tls: svc.backend_tls,
                     })
                     .collect()
             };

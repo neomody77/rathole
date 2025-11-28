@@ -111,6 +111,10 @@ pub struct ServerServiceConfig {
     /// Examples: ["app.example.com", "*.api.example.com"]
     #[serde(default)]
     pub domains: Vec<String>,
+    /// Whether the backend service uses HTTPS (for HTTP proxy routing)
+    /// If true, the proxy will connect to the backend using HTTPS
+    #[serde(default)]
+    pub backend_tls: bool,
 }
 
 impl ServerServiceConfig {
@@ -204,6 +208,10 @@ pub struct HttpProxyConfig {
     /// HTTPS listen address
     #[serde(default = "default_http_proxy_https_addr")]
     pub https_addr: String,
+    /// TLS certificate file path (PEM format)
+    pub tls_cert: Option<String>,
+    /// TLS private key file path (PEM format)
+    pub tls_key: Option<String>,
     /// ACME configuration for automatic HTTPS certificates
     pub acme: Option<AcmeConfig>,
 }

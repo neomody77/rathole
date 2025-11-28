@@ -4,6 +4,8 @@
 //! - Domain-based routing (Host header / SNI)
 //! - Wildcard domain support (e.g., *.example.com)
 //! - Dynamic service mapping updates
+//! - HTTPS termination with manual certificates
+//! - Backend TLS support (https->https, https->http)
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -22,15 +24,24 @@ pub struct ProxyServiceInfo {
     pub name: String,
     pub bind_addr: String,
     pub domains: Vec<String>,
+    /// Whether the backend uses HTTPS
+    pub backend_tls: bool,
+}
+
+/// Backend routing information
+#[derive(Debug, Clone)]
+pub struct BackendInfo {
+    pub bind_addr: String,
+    pub use_tls: bool,
 }
 
 /// Domain matcher for wildcard support
 pub struct DomainMatcher {
-    /// Exact domain matches: domain -> service_bind_addr
-    exact: HashMap<String, String>,
-    /// Wildcard patterns: (suffix, service_bind_addr)
+    /// Exact domain matches: domain -> backend info
+    exact: HashMap<String, BackendInfo>,
+    /// Wildcard patterns: (suffix, backend info)
     /// e.g., ".example.com" for *.example.com
-    wildcards: Vec<(String, String)>,
+    wildcards: Vec<(String, BackendInfo)>,
 }
 
 impl DomainMatcher {
@@ -42,33 +53,37 @@ impl DomainMatcher {
     }
 
     /// Add a domain pattern for a service
-    pub fn add(&mut self, pattern: &str, bind_addr: &str) {
+    pub fn add(&mut self, pattern: &str, bind_addr: &str, use_tls: bool) {
+        let backend = BackendInfo {
+            bind_addr: bind_addr.to_string(),
+            use_tls,
+        };
         if pattern.starts_with("*.") {
             // Wildcard pattern: *.example.com -> .example.com
             let suffix = pattern.strip_prefix('*').unwrap().to_lowercase();
-            self.wildcards.push((suffix, bind_addr.to_string()));
+            self.wildcards.push((suffix, backend));
         } else {
             // Exact match
-            self.exact.insert(pattern.to_lowercase(), bind_addr.to_string());
+            self.exact.insert(pattern.to_lowercase(), backend);
         }
     }
 
-    /// Match a domain and return the service bind address
-    pub fn match_domain(&self, domain: &str) -> Option<&str> {
+    /// Match a domain and return the backend info
+    pub fn match_domain(&self, domain: &str) -> Option<&BackendInfo> {
         let domain_lower = domain.to_lowercase();
 
         // Strip port if present
         let domain_without_port = domain_lower.split(':').next().unwrap_or(&domain_lower);
 
         // Try exact match first
-        if let Some(addr) = self.exact.get(domain_without_port) {
-            return Some(addr);
+        if let Some(backend) = self.exact.get(domain_without_port) {
+            return Some(backend);
         }
 
         // Try wildcard matches
-        for (suffix, addr) in &self.wildcards {
+        for (suffix, backend) in &self.wildcards {
             if domain_without_port.ends_with(suffix) {
-                return Some(addr);
+                return Some(backend);
             }
         }
 
@@ -112,8 +127,8 @@ impl HttpProxyState {
 
         for svc in services {
             for domain in &svc.domains {
-                matcher.add(domain, &svc.bind_addr);
-                debug!("HTTP proxy: {} -> {}", domain, svc.bind_addr);
+                matcher.add(domain, &svc.bind_addr, svc.backend_tls);
+                debug!("HTTP proxy: {} -> {} (tls: {})", domain, svc.bind_addr, svc.backend_tls);
             }
             svc_map.insert(svc.name.clone(), svc);
         }
@@ -140,8 +155,8 @@ impl HttpProxyState {
 
         // Add new domains
         for domain in &svc.domains {
-            matcher.add(domain, &svc.bind_addr);
-            debug!("HTTP proxy: {} -> {}", domain, svc.bind_addr);
+            matcher.add(domain, &svc.bind_addr, svc.backend_tls);
+            debug!("HTTP proxy: {} -> {} (tls: {})", domain, svc.bind_addr, svc.backend_tls);
         }
 
         svc_map.insert(svc.name.clone(), svc);
@@ -205,18 +220,27 @@ impl ProxyHttp for RatholeHttpProxy {
 
         // Look up service by domain
         let matcher = self.state.matcher.read().await;
-        let bind_addr = match matcher.match_domain(host) {
-            Some(addr) => addr.to_string(),
+        let backend = match matcher.match_domain(host) {
+            Some(b) => b.clone(),
             None => {
                 warn!("HTTP proxy: Unknown domain: {}", host);
                 return Err(pingora::Error::new(pingora::ErrorType::HTTPStatus(404)).into_down());
             }
         };
+        drop(matcher); // Release read lock
 
-        debug!("HTTP proxy: {} -> {}", host, bind_addr);
+        debug!("HTTP proxy: {} -> {} (tls: {})", host, backend.bind_addr, backend.use_tls);
 
-        // Parse bind address
-        let peer = HttpPeer::new(&bind_addr, false, String::new());
+        // Create peer with or without TLS
+        // For TLS backend, use the host for SNI
+        let sni = if backend.use_tls {
+            // Extract hostname without port for SNI
+            host.split(':').next().unwrap_or(host).to_string()
+        } else {
+            String::new()
+        };
+
+        let peer = HttpPeer::new(&backend.bind_addr, backend.use_tls, sni);
         Ok(Box::new(peer))
     }
 
@@ -261,9 +285,21 @@ impl HttpProxyServer {
     /// Run the HTTP proxy server
     /// Note: Pingora runs its own runtime, so we spawn it in a separate OS thread
     pub async fn run(self, mut shutdown_rx: tokio::sync::broadcast::Receiver<bool>) -> Result<()> {
-        info!("Starting HTTP proxy on {}", self.config.http_addr);
+        let has_tls = self.config.tls_cert.is_some() && self.config.tls_key.is_some();
+
+        if has_tls {
+            info!(
+                "Starting HTTP proxy on {} (HTTP) and {} (HTTPS)",
+                self.config.http_addr, self.config.https_addr
+            );
+        } else {
+            info!("Starting HTTP proxy on {} (HTTP only)", self.config.http_addr);
+        }
 
         let http_addr = self.config.http_addr.clone();
+        let https_addr = self.config.https_addr.clone();
+        let tls_cert = self.config.tls_cert.clone();
+        let tls_key = self.config.tls_key.clone();
         let state = self.state.clone();
 
         // Run Pingora in a separate OS thread to avoid runtime conflicts
@@ -279,9 +315,33 @@ impl HttpProxyServer {
 
             let proxy = RatholeHttpProxy::new(state);
             let mut http_service = http_proxy_service(&server.configuration, proxy);
+
+            // Add HTTP listener
             http_service.add_tcp(&http_addr);
 
-            // TODO: Add HTTPS support with ACME in Phase 2
+            // Add HTTPS listener if TLS is configured
+            if let (Some(cert_path), Some(key_path)) = (tls_cert, tls_key) {
+                use pingora::listeners::tls::TlsSettings;
+                use std::path::Path;
+
+                // Verify files exist
+                if !Path::new(&cert_path).exists() {
+                    error!("TLS certificate file not found: {}", cert_path);
+                } else if !Path::new(&key_path).exists() {
+                    error!("TLS key file not found: {}", key_path);
+                } else {
+                    match TlsSettings::intermediate(&cert_path, &key_path) {
+                        Ok(mut tls_settings) => {
+                            tls_settings.enable_h2();
+                            http_service.add_tls_with_settings(&https_addr, None, tls_settings);
+                            info!("HTTPS enabled on {}", https_addr);
+                        }
+                        Err(e) => {
+                            error!("Failed to create TLS settings: {}", e);
+                        }
+                    }
+                }
+            }
 
             server.add_service(http_service);
             server.run_forever();
@@ -306,45 +366,64 @@ mod tests {
     #[test]
     fn test_domain_matcher_exact() {
         let mut matcher = DomainMatcher::new();
-        matcher.add("example.com", "127.0.0.1:8080");
-        matcher.add("api.example.com", "127.0.0.1:8081");
+        matcher.add("example.com", "127.0.0.1:8080", false);
+        matcher.add("api.example.com", "127.0.0.1:8081", true);
 
-        assert_eq!(matcher.match_domain("example.com"), Some("127.0.0.1:8080"));
-        assert_eq!(matcher.match_domain("api.example.com"), Some("127.0.0.1:8081"));
-        assert_eq!(matcher.match_domain("unknown.com"), None);
+        let backend1 = matcher.match_domain("example.com").unwrap();
+        assert_eq!(backend1.bind_addr, "127.0.0.1:8080");
+        assert!(!backend1.use_tls);
+
+        let backend2 = matcher.match_domain("api.example.com").unwrap();
+        assert_eq!(backend2.bind_addr, "127.0.0.1:8081");
+        assert!(backend2.use_tls);
+
+        assert!(matcher.match_domain("unknown.com").is_none());
     }
 
     #[test]
     fn test_domain_matcher_wildcard() {
         let mut matcher = DomainMatcher::new();
-        matcher.add("*.example.com", "127.0.0.1:8080");
-        matcher.add("exact.example.com", "127.0.0.1:8081");
+        matcher.add("*.example.com", "127.0.0.1:8080", false);
+        matcher.add("exact.example.com", "127.0.0.1:8081", false);
 
         // Exact match takes precedence
-        assert_eq!(matcher.match_domain("exact.example.com"), Some("127.0.0.1:8081"));
+        assert_eq!(matcher.match_domain("exact.example.com").unwrap().bind_addr, "127.0.0.1:8081");
 
         // Wildcard matches
-        assert_eq!(matcher.match_domain("app.example.com"), Some("127.0.0.1:8080"));
-        assert_eq!(matcher.match_domain("api.example.com"), Some("127.0.0.1:8080"));
+        assert_eq!(matcher.match_domain("app.example.com").unwrap().bind_addr, "127.0.0.1:8080");
+        assert_eq!(matcher.match_domain("api.example.com").unwrap().bind_addr, "127.0.0.1:8080");
 
         // Does not match root domain
-        assert_eq!(matcher.match_domain("example.com"), None);
+        assert!(matcher.match_domain("example.com").is_none());
     }
 
     #[test]
     fn test_domain_matcher_case_insensitive() {
         let mut matcher = DomainMatcher::new();
-        matcher.add("Example.COM", "127.0.0.1:8080");
+        matcher.add("Example.COM", "127.0.0.1:8080", false);
 
-        assert_eq!(matcher.match_domain("example.com"), Some("127.0.0.1:8080"));
-        assert_eq!(matcher.match_domain("EXAMPLE.COM"), Some("127.0.0.1:8080"));
+        assert_eq!(matcher.match_domain("example.com").unwrap().bind_addr, "127.0.0.1:8080");
+        assert_eq!(matcher.match_domain("EXAMPLE.COM").unwrap().bind_addr, "127.0.0.1:8080");
     }
 
     #[test]
     fn test_domain_matcher_with_port() {
         let mut matcher = DomainMatcher::new();
-        matcher.add("example.com", "127.0.0.1:8080");
+        matcher.add("example.com", "127.0.0.1:8080", false);
 
-        assert_eq!(matcher.match_domain("example.com:443"), Some("127.0.0.1:8080"));
+        assert_eq!(matcher.match_domain("example.com:443").unwrap().bind_addr, "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn test_backend_tls() {
+        let mut matcher = DomainMatcher::new();
+        matcher.add("http.example.com", "127.0.0.1:8080", false);
+        matcher.add("https.example.com", "127.0.0.1:8443", true);
+
+        let http_backend = matcher.match_domain("http.example.com").unwrap();
+        assert!(!http_backend.use_tls);
+
+        let https_backend = matcher.match_domain("https.example.com").unwrap();
+        assert!(https_backend.use_tls);
     }
 }
