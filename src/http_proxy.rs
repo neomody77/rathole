@@ -259,34 +259,41 @@ impl HttpProxyServer {
     }
 
     /// Run the HTTP proxy server
+    /// Note: Pingora runs its own runtime, so we spawn it in a separate OS thread
     pub async fn run(self, mut shutdown_rx: tokio::sync::broadcast::Receiver<bool>) -> Result<()> {
         info!("Starting HTTP proxy on {}", self.config.http_addr);
 
-        let mut server = Server::new(None)?;
-        server.bootstrap();
+        let http_addr = self.config.http_addr.clone();
+        let state = self.state.clone();
 
-        let proxy = RatholeHttpProxy::new(self.state.clone());
-        let mut http_service = http_proxy_service(&server.configuration, proxy);
-        http_service.add_tcp(&self.config.http_addr);
+        // Run Pingora in a separate OS thread to avoid runtime conflicts
+        let server_handle = std::thread::spawn(move || {
+            let mut server = match Server::new(None) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("Failed to create HTTP proxy server: {}", e);
+                    return;
+                }
+            };
+            server.bootstrap();
 
-        // TODO: Add HTTPS support with ACME in Phase 2
+            let proxy = RatholeHttpProxy::new(state);
+            let mut http_service = http_proxy_service(&server.configuration, proxy);
+            http_service.add_tcp(&http_addr);
 
-        server.add_service(http_service);
+            // TODO: Add HTTPS support with ACME in Phase 2
 
-        // Run server in background
-        let server_handle = tokio::spawn(async move {
+            server.add_service(http_service);
             server.run_forever();
         });
 
         // Wait for shutdown signal
-        tokio::select! {
-            _ = shutdown_rx.recv() => {
-                info!("HTTP proxy received shutdown signal");
-            }
-            _ = server_handle => {
-                warn!("HTTP proxy server exited unexpectedly");
-            }
-        }
+        let _ = shutdown_rx.recv().await;
+        info!("HTTP proxy received shutdown signal");
+
+        // Note: Pingora doesn't have a clean shutdown mechanism in run_forever()
+        // The thread will be terminated when the process exits
+        drop(server_handle);
 
         Ok(())
     }
