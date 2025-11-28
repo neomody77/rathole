@@ -43,6 +43,9 @@ pub struct ServiceInfo {
     /// Domain names for HTTP proxy routing (supports wildcards like "*.example.com")
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub domains: Vec<String>,
+    /// Whether the backend service uses HTTPS
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub backend_tls: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -55,6 +58,9 @@ pub struct CreateServiceRequest {
     /// Domain names for HTTP proxy routing (supports wildcards like "*.example.com")
     #[serde(default)]
     pub domains: Vec<String>,
+    /// Whether the backend service uses HTTPS
+    #[serde(default)]
+    pub backend_tls: bool,
 }
 
 fn default_service_type() -> String {
@@ -196,6 +202,7 @@ async fn list_services(
             bind_addr: svc.bind_addr.clone(),
             token: None,
             domains: svc.domains.clone(),
+            backend_tls: svc.backend_tls,
         })
         .collect();
 
@@ -224,6 +231,7 @@ async fn get_service(
             bind_addr: svc.bind_addr.clone(),
             token: None,
             domains: svc.domains.clone(),
+            backend_tls: svc.backend_tls,
         })),
         None => Err((
             StatusCode::NOT_FOUND,
@@ -270,6 +278,7 @@ async fn create_service(
                 bind_addr: svc.bind_addr.clone(),
                 token: None,
                 domains: svc.domains.clone(),
+                backend_tls: svc.backend_tls,
             })));
         }
     }
@@ -324,6 +333,7 @@ async fn create_service(
         token: Some(MaskedString::from(req.token.as_str())),
         nodelay: None,
         domains: req.domains.clone(),
+        backend_tls: req.backend_tls,
     };
 
     // Send update event
@@ -363,6 +373,7 @@ async fn create_service(
             bind_addr,
             token: None,
             domains: req.domains,
+            backend_tls: req.backend_tls,
         }),
     ))
 }
